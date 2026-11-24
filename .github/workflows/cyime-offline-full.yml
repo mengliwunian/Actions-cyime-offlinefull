@@ -1,0 +1,587 @@
+# CyIME 离线全内置自动构建
+# 用法：把本文件放到你自己的 GitHub 仓库 .github/workflows/cyime-offline-full.yml
+# 每次定时/手动运行：拉取 Cyletix/CyIME 最新 main -> 从 GitHub 最新 full-arm64 Release APK 提取翻译库 -> 改造 -> 编译 -> 发布到你自己的 Release。
+# 翻译库策略：
+#   1. 始终从 GitHub 上 Cyletix/CyIME 最新 Release 的 full-arm64-v8a APK 中提取
+#      lib/arm64-v8a/libcytranslate.so（不走 ModelScope）；
+#   2. 上游写死的 SHA 与任何已发布 APK 都不一致，因此用 Gradle init script 仅接管
+#      该库的校验任务，绝不改动任何上游源码文件（包括哈希映射）。
+name: CyIME Offline Full Auto Build
+
+on:
+  #schedule:
+    # UTC 17:17 = 北京时间次日 01:17，错开整点避免排队丢弃
+    #- cron: '17 17 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cyime-offline-full
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    # GitHub 不允许在 if: 中直接引用 secrets.*，先在 job 级 env 映射
+    env:
+      SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+      ALIAS: ${{ secrets.ALIAS }}
+      KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout CyIME main (with submodules)
+        uses: actions/checkout@v4
+        with:
+          repository: Cyletix/CyIME
+          ref: main
+          path: cyime-src
+          submodules: recursive
+          fetch-depth: 0
+
+      # 始终从 GitHub 上最新的 *-full-arm64-v8a.apk 提取；不使用 ModelScope。
+      - name: Resolve latest GitHub full-arm64 APK
+        id: latest_apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LINE="$(gh api "repos/Cyletix/CyIME/releases?per_page=30" \
+            --jq '[.[] | . as $r | (.assets[]? | select(.name | test("-full-arm64-v8a\\.apk$")) | [$r.tag_name, .browser_download_url, (.id|tostring), .updated_at])] | map(select(length == 4)) | if length > 0 then .[0] | @tsv else empty end')"
+          if [[ -z "$LINE" ]]; then
+            echo "::error::No Cyletix/CyIME release with a *-full-arm64-v8a.apk asset found."
+            exit 1
+          fi
+          IFS=$'\t' read -r TAG URL ASSET_ID UPDATED_AT <<< "$LINE"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "asset_id=$ASSET_ID" >> "$GITHUB_OUTPUT"
+          echo "updated_at=$UPDATED_AT" >> "$GITHUB_OUTPUT"
+          echo "cache_stamp=${UPDATED_AT//:/-}" >> "$GITHUB_OUTPUT"
+          echo "Latest GitHub full APK: release $TAG (asset $ASSET_ID, updated $UPDATED_AT)"
+
+      # 绑定 asset id + updated_at：同一个 Release 不重复下载 400~600MB 的 APK，
+      # GitHub 上一旦换了包就自动重新下载。
+      - name: Cache extracted translation library
+        id: translate_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cyime-translate-so
+          key: cyime-translate-arm64-${{ steps.latest_apk.outputs.asset_id }}-${{ steps.latest_apk.outputs.cache_stamp }}
+
+      - name: Extract libcytranslate.so from GitHub full APK
+        run: |
+          set -euo pipefail
+          DST="$GITHUB_WORKSPACE/cyime-src/.codex-artifacts/offline-translate/libs/arm64-v8a/libcytranslate.so"
+          CACHE_DIR="$RUNNER_TEMP/cyime-translate-so"
+          CACHED="$CACHE_DIR/libcytranslate.so"
+          mkdir -p "$CACHE_DIR" "$(dirname "$DST")"
+
+          if [[ "${{ steps.translate_cache.outputs.cache-hit }}" == "true" && -f "$CACHED" ]]; then
+            echo "Reusing cached libcytranslate.so from GitHub release ${{ steps.latest_apk.outputs.tag }}"
+          else
+            APK="$RUNNER_TEMP/CyIME-full-arm64-v8a.apk"
+            echo "Downloading GitHub release ${{ steps.latest_apk.outputs.tag }} full-arm64 APK..."
+            curl -fL --retry 3 --connect-timeout 30 -o "$APK" "${{ steps.latest_apk.outputs.url }}"
+            APK_MAGIC="$(head -c 4 "$APK" | od -An -tx1 | tr -d ' \n')"
+            if [[ "$APK_MAGIC" != "504b0304" ]]; then
+              echo "::error::Downloaded APK is not a ZIP (magic=$APK_MAGIC)"
+              exit 1
+            fi
+            if ! command -v unzip >/dev/null 2>&1; then
+              sudo apt-get update && sudo apt-get install -y unzip
+            fi
+            unzip -p "$APK" 'lib/arm64-v8a/libcytranslate.so' > "$CACHED"
+            rm -f "$APK"
+          fi
+
+          python3 - "$CACHED" <<'PY'
+          import struct, sys
+          p = sys.argv[1]
+          with open(p, 'rb') as f:
+              h = f.read(20)
+          if len(h) < 20 or h[:4] != b'\x7fELF':
+              sys.exit('::error::libcytranslate.so is not an ELF shared library')
+          if h[4] != 2 or struct.unpack_from('<H', h, 18)[0] != 183:
+              sys.exit('::error::libcytranslate.so is not an AArch64 (arm64-v8a) ELF')
+          PY
+
+          SIZE="$(stat -c%s "$CACHED")"
+          if (( SIZE < 200000 || SIZE > 20000000 )); then
+            echo "::error::Extracted lib size looks wrong ($SIZE bytes)."
+            exit 1
+          fi
+          SHA="$(sha256sum "$CACHED" | cut -d' ' -f1)"
+          echo "Extracted libcytranslate.so from GitHub ${{ steps.latest_apk.outputs.tag }}: size=$SIZE sha256=$SHA"
+          mkdir -p "$(dirname "$DST")"
+          cp "$CACHED" "$DST"
+
+      # Gradle init script 只替换 prepareOfflineTranslateLibraries 的动作：
+      #   - 使用上一步从 GitHub 最新 full APK 提取的 arm64 库；
+      #   - 与源码写死的 SHA 不一致时只打印提示并继续（上游 pin 与已发布 APK 历来不一致）；
+      #   - 跳过从未发布过的 x86_64 库，避免 Release 构建被它卡住。
+      # 上游源码一个字节都不改，方便与 Cyletix/CyIME main 保持同步。
+      - name: Generate Gradle init script for translate library (no source edits)
+        run: |
+          cat > "$RUNNER_TEMP/cyime-translate-init.gradle" <<'GRADLE'
+          gradle.projectsEvaluated {
+              gradle.rootProject.allprojects { p ->
+                  def t = p.tasks.findByName('prepareOfflineTranslateLibraries')
+                  if (t == null) return
+                  t.actions.clear()
+                  t.doLast {
+                      def dirProp = p.findProperty('cyime.translateLibDir')
+                      def envDir = System.getenv('CYIME_TRANSLATE_LIB_DIR')
+                      def base = dirProp ?: envDir ?: "${p.rootProject.projectDir}/.codex-artifacts/offline-translate/libs"
+                      def src = new File(base, 'arm64-v8a/libcytranslate.so')
+                      if (!src.isFile()) {
+                          throw new GradleException("offline-full: missing staged ${src}")
+                      }
+                      def mapping = new File(p.rootProject.projectDir, 'app/build-logic/tasks-offline-translate.gradle.kts')
+                      def m = mapping.text =~ /"arm64-v8a"\s+to\s+"([0-9a-f]{64})"/
+                      if (!m.find()) {
+                          throw new GradleException("offline-full: cannot read upstream arm64 SHA pin from ${mapping}")
+                      }
+                      def expected = m.group(1)
+                      def actual = java.security.MessageDigest.getInstance('SHA-256').digest(src.bytes).collect { String.format('%02x', it & 0xff) }.join()
+                      if (actual == expected) {
+                          println "offline-full: staged library matches upstream SHA pin ${expected}"
+                      } else {
+                          println "offline-full: staged library SHA ${actual} differs from upstream pin ${expected}; using it anyway (source untouched)"
+                      }
+                      def targetRoot = p.layout.buildDirectory.dir('generated/translate-jniLibs').get().asFile
+                      targetRoot.listFiles()?.findAll { it.isDirectory() && it.name != 'arm64-v8a' }?.each { it.deleteDir() }
+                      def dst = new File(targetRoot, 'arm64-v8a/libcytranslate.so')
+                      dst.parentFile.mkdirs()
+                      dst.bytes = src.bytes
+                      println "offline-full: installed libcytranslate.so from ${src}"
+                  }
+              }
+          }
+          GRADLE
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: cyime-src/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install NDK and build-tools
+        run: |
+          sdkmanager "platform-tools" "build-tools;36.0.0" "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Install native build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build unzip
+
+      - name: Cache ONNX runtime
+        uses: actions/cache@v4
+        with:
+          path: |
+            cyime-src/app/src/main/jni/onnxruntime
+            cyime-src/app/src/main/jniLibs/**/libonnxruntime.so
+          key: native-${{ runner.os }}-${{ hashFiles('cyime-src/app/build-logic/tasks-native.gradle.kts') }}
+          restore-keys: native-${{ runner.os }}-
+
+      - name: Cache CMake native build
+        uses: actions/cache@v4
+        with:
+          path: |
+            cyime-src/app/.cxx
+            cyime-src/app/src/main/jni/boost
+            cyime-src/app/src/main/jni/boost-*.tar.xz
+          key: cmake-${{ runner.os }}-${{ hashFiles('cyime-src/app/src/main/jni/CMakeLists.txt') }}
+          restore-keys: cmake-${{ runner.os }}-
+
+      - name: Warm up native deps
+        working-directory: cyime-src
+        run: ./gradlew downloadOnnx --no-daemon
+
+      # ------------------------------------------------------------------
+      # 源码改造（全部内嵌，单文件即可用）
+      # ------------------------------------------------------------------
+      - name: Patch source for offline-full build
+        working-directory: cyime-src
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          ROOT = Path('.').resolve()
+          TRANSLATE_IDS = ('translate-zh-en', 'translate-en-zh')
+          NETWORK_PERMISSIONS = (
+              'INTERNET',
+              'ACCESS_WIFI_STATE',
+              'ACCESS_NETWORK_STATE',
+              'REQUEST_INSTALL_PACKAGES',
+          )
+          MODELSCOPE_BASE = 'https://www.modelscope.cn/models/Cyletix/cyime-model/resolve/master/'
+          RELEASE_BASE = 'https://github.com/Cyletix/CyIME/releases/download/models/'
+
+
+          def fail(msg):
+              print(f'::error::{msg}', flush=True)
+              sys.exit(1)
+
+
+          def patch(path, fn, label, allow_noop=False):
+              p = ROOT / path
+              if not p.is_file():
+                  fail(f'missing file: {path}')
+              text = p.read_text(encoding='utf-8')
+              new = fn(text)
+              if new == text:
+                  if allow_noop:
+                      print(f'already patched, skipped: {label} ({path})', flush=True)
+                      return
+                  fail(f'patch produced no change: {label} ({path})')
+              p.write_text(new, encoding='utf-8')
+              print(f'patched: {label} -> {path}', flush=True)
+
+
+          # 1) 白名单加入双向翻译模型
+          def add_translate_to_included(text):
+              m = re.search(r'(INCLUDED\s*=\s*\{)(.*?)(\})', text, re.S)
+              if not m:
+                  fail('cannot find INCLUDED set in scripts/prepare-bundled-models.py')
+              ids = set(re.findall(r"['\"]([^'\"]+)['\"]", m.group(2)))
+              ids.update(TRANSLATE_IDS)
+              replacement = ', '.join(f"'{i}'" for i in sorted(ids))
+              return text[:m.start(2)] + replacement + text[m.end(2):]
+
+
+          patch('scripts/prepare-bundled-models.py', add_translate_to_included,
+                'bundle translate-zh-en / translate-en-zh', allow_noop=True)
+
+
+          # 1b) 用整段替换的方式重写 catalog() 与 download()，使其：
+          #     - 在解析 Kotlin 目录前把 RELEASE/CYIME_MODELSCOPE/$reazonBase 等拼接常量展开为字面 URL；
+          #     - 解析每个 ModelFile 的 mirrors 字段；
+          #     - download 时主源失败或 SHA 不符则依次尝试 mirrors（全部严格校验 SHA）。
+          #     这样 speaker（GitHub k2-fsa 源文件变更）、翻译模型（GitHub Release 无文件）都能靠目录自带镜像回退成功。
+          def rewrite_catalog_and_download(text):
+              if 'offline-full patch: mirror-aware catalog' in text:
+                  return text
+              start = text.index('def catalog():')
+              end = text.index('def prepare(')
+              if start < 0 or end < 0:
+                  fail('cannot locate catalog()/prepare() boundaries')
+              replacement = r'''# offline-full patch: mirror-aware catalog + download
+          _MS = 'https://www.modelscope.cn/models/Cyletix/cyime-model/resolve/master/'
+          _RELEASE = 'https://github.com/Cyletix/CyIME/releases/download/models/'
+          _MODELSCOPE = 'https://www.modelscope.cn/models/Cyletix/cyime-model/resolve/master/'
+
+
+          def _expand_kotlin(source):
+              # Turn Kotlin string concatenations / interpolations into literal URLs so the
+              # simple regex below can read them. Order matters: longest prefix first.
+              source = re.sub(r'DownloadMirrors\.CYIME_MODELSCOPE\s*\+\s*"([^"]+)"',
+                              lambda m: '"' + _MODELSCOPE + m.group(1) + '"', source)
+              source = re.sub(r'\$reazonBase/([A-Za-z0-9_.\-]+)',
+                              lambda m: 'https://huggingface.co/reazon-research/reazonspeech-k2-v2/resolve/291488c8151be24d7da4bf7af26e533fad96e407/' + m.group(1),
+                              source)
+              source = re.sub(r'RELEASE\s*\+\s*"([^"]+)"',
+                              lambda m: '"' + _RELEASE + m.group(1) + '"', source)
+              return source
+
+
+          def _parse_mirrors(raw):
+              if not raw:
+                  return []
+              return [u for u in re.findall(r'"([^"]+)"', raw) if u.startswith('http')]
+
+
+          def catalog():
+              models = []
+              for name in ('model/BuiltinModelCatalog.kt', 'speech/SpeechModelCatalog.kt'):
+                  source = (ROOT / 'app/src/main/java/com/kingzcheung/xime' / name).read_text(encoding='utf-8')
+                  source = _expand_kotlin(source)
+                  constants = dict(re.findall(r'const val (\w+) = "([^"]+)"', source))
+                  for block in source.split('ModelInfo(')[1:]:
+                      literal = re.match(r'"([^"]+)"', block)
+                      model_id = literal[1] if literal else constants.get(re.match(r'(\w+)', block)[1], '')
+                      version = re.search(r'ModelVersion\(version = "([^"]+)"', block)[1]
+                      block = 'ModelVersion('.join(block.split('ModelVersion(')[:2])  # newest version only
+                      title = re.match(r'(?:"[^"]+"|\w+),\s*"([^"]+)"', block)
+                      pat = re.compile(
+                          r'ModelFile\("([^"]+)",\s*"([^"]*)",\s*"([^"]*)",\s*(\d+)L'
+                          r'(?:,\s*mirrors\s*=\s*listOf\(([^)]*)\))?', re.S)
+                      files = []
+                      for m in pat.finditer(block):
+                          files.append(dict(name=m.group(1), url=m.group(2), sha256=m.group(3),
+                                            size=int(m.group(4)), mirrors=_parse_mirrors(m.group(5))))
+                      archive = re.search(r'archiveUrl = "([^"]+)", sha256 = "([^"]+)"', block)
+                      if model_id in INCLUDED and (not files or (not archive and any(
+                              not f['sha256'] or not f['url'] for f in files))):
+                          raise ValueError(f'Unsupported/incomplete pinned catalog: {model_id}')
+                      models.append(dict(id=model_id, name=title[1] if title else model_id, version=version, files=files,
+                                         archive=archive.groups() if archive else None))
+              ids = [m['id'] for m in models]
+              if len(set(ids)) != len(ids) or not INCLUDED <= set(ids):
+                  raise ValueError('Catalog changed: review the offline model edition before building')
+              return [m for m in models if m['id'] in INCLUDED]
+
+
+          def download(url, target, sha, mirrors=None):
+              if target.is_file() and digest(target) == sha:
+                  return
+              target.parent.mkdir(parents=True, exist_ok=True)
+              temporary = target.with_suffix(target.suffix + '.part')
+              print(f'Downloading {target.name}', flush=True)
+              sources = [url] + [m for m in (mirrors or []) if m and m != url]
+              # Last resort: fixed ModelScope mirror named exactly as the catalog file name.
+              fallback = _MS + target.name
+              if fallback not in sources:
+                  sources.append(fallback)
+              last_error = None
+              for source_url in sources:
+                  try:
+                      with urllib.request.urlopen(source_url, timeout=180) as src, temporary.open('wb') as dst:
+                          shutil.copyfileobj(src, dst)
+                      if digest(temporary) == sha:
+                          temporary.replace(target)
+                          return
+                      last_error = f'Checksum mismatch from {source_url}: {target.name}'
+                  except Exception as exc:  # noqa: BLE001 - try next source
+                      last_error = f'{source_url}: {exc}'
+              raise ValueError(last_error or f'Checksum mismatch: {target.name}')
+
+
+          '''
+              return text[:start] + replacement + text[end:]
+
+
+          patch('scripts/prepare-bundled-models.py', rewrite_catalog_and_download,
+                'mirror-aware catalog + download', allow_noop=True)
+
+
+          # 1c) prepare() 把 mirrors 传给 download（两处调用：archive 与 files）
+          def pass_mirrors_to_download(text):
+              if 'offline-full patch: pass mirrors' in text:
+                  return text
+              old1 = "            download(url, archive, sha)"
+              new1 = "            download(url, archive, sha, mirrors=None)  # offline-full patch: pass mirrors"
+              old2 = "                download(info['url'], cached, info['sha256'])"
+              new2 = "                download(info['url'], cached, info['sha256'], mirrors=info.get('mirrors'))  # offline-full patch: pass mirrors"
+              if old1 not in text or old2 not in text:
+                  fail('prepare() download call sites changed upstream; review manually')
+              text = text.replace(old1, new1, 1).replace(old2, new2, 1)
+              return text
+
+
+          patch('scripts/prepare-bundled-models.py', pass_mirrors_to_download,
+                'pass mirrors into download()', allow_noop=True)
+
+
+          # 2) 安装器白名单同步
+          def add_translate_to_installer(text):
+              m = re.search(r'(val modelIds\s*=\s*setOf\()([^)]*)(\))', text, re.S)
+              if not m:
+                  fail('cannot find modelIds in BundledModelInstaller.kt')
+              inner = m.group(2).rstrip()
+              if 'translate-zh-en' in inner:
+                  return text
+              if not inner.endswith(','):
+                  inner += ','
+              inner += '\n        "translate-zh-en", "translate-en-zh",'
+              return text[:m.start(2)] + inner + text[m.end(2):]
+
+
+          patch('app/src/main/java/com/kingzcheung/xime/model/BundledModelInstaller.kt',
+                add_translate_to_installer, 'installer modelIds', allow_noop=True)
+
+
+          # 3) 去联网：仅改 Manifest 声明
+          def strip_network_permissions(text):
+              for perm in NETWORK_PERMISSIONS:
+                  pattern = (
+                      r'^[ \t]*<uses-permission[^>]*android:name="android\.permission\.'
+                      + re.escape(perm) + r'"[^>]*\/>[ \t]*\r?\n?'
+                  )
+                  text, n = re.subn(pattern, '', text, flags=re.M)
+                  if n > 1:
+                      fail(f'expected at most 1 {perm} permission declaration, found {n}')
+                  if n == 0:
+                      print(f'permission already absent: {perm}', flush=True)
+              if 'android.permission.INTERNET' in text:
+                  fail('INTERNET still present in AndroidManifest.xml')
+              return text
+
+
+          patch('app/src/main/AndroidManifest.xml', strip_network_permissions,
+                'remove INTERNET / WIFI / NETWORK_STATE / INSTALL_PACKAGES')
+
+
+          # 4) 合规文案
+          def notice_bundled(text):
+              old = 'Models (downloaded on request, not bundled): Firefox Translations zh-en and en-zh'
+              if old in text:
+                  return text.replace(
+                      old,
+                      'Models (BUNDLED in this offline-full build): Firefox Translations zh-en and en-zh',
+                      1,
+                  )
+              if 'Models (BUNDLED in this offline-full build)' in text:
+                  return text
+              fail('NOTICE.txt translation model wording changed upstream; review manually')
+
+
+          patch('app/src/main/assets/NOTICE.txt', notice_bundled,
+                'NOTICE.txt: translation models marked bundled', allow_noop=True)
+
+          # 5) tasks-offline-translate.gradle.kts 一个字节都不改：
+          #    上游写死的 libcytranslate.so 哈希保持原样，便于与 main 同步；
+          #    库本身由前面的「GitHub 最新 full APK 提取 + init script」准备。
+
+          # 6) 只构建 arm64-v8a：
+          #    - 删除整个 ndk { abiFilters += ... } 块（AGP 9 不允许 ndk.abiFilters 与 splits.abi
+          #      同时指定同一 ABI，否则报 "Conflicting configuration"）；
+          #    - splits.abi.include 只留 arm64-v8a，并关闭 universal APK。
+          #    这样 Gradle 只产出一个 arm64-v8a APK。
+          def restrict_to_arm64(text):
+              if 'offline-full patch: arm64 only' in text:
+                  return text
+              ndk_pat = re.compile(r'^[ \t]*ndk\s*\{[^{}]*abiFilters[^{}]*\}[ \t]*\r?\n?', re.S | re.M)
+              text, n = ndk_pat.subn('', text)
+              if n != 1:
+                  fail(f'expected exactly 1 ndk abiFilters block, found {n}')
+              replacements = (
+                  ('include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")',
+                   'include("arm64-v8a")  // offline-full patch: arm64 only'),
+                  ('isUniversalApk = true',
+                   'isUniversalApk = false  // offline-full patch: arm64 only'),
+              )
+              for old, _ in replacements:
+                  if old not in text:
+                      fail(f'ABI config not found upstream: {old}')
+              for old, new in replacements:
+                  text = text.replace(old, new, 1)
+              return text
+
+          patch('app/build.gradle.kts', restrict_to_arm64,
+                'arm64-v8a only (no other ABI / no universal)', allow_noop=True)
+
+          print('All patches applied successfully.', flush=True)
+          PY
+
+          cd "$GITHUB_WORKSPACE/cyime-src"
+          echo "BUILD_DATE=$(date +'%Y%m%d')" >> "$GITHUB_ENV"
+          echo "BUILD_DASH=$(date +'%Y-%m-%d')" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          git diff --stat
+          # 硬约束：翻译库哈希文件必须与原仓库完全一致
+          if ! git diff --quiet -- app/build-logic/tasks-offline-translate.gradle.kts; then
+            echo "::error::offline-full must not modify upstream translate library hashes"
+            exit 1
+          fi
+
+      - name: Build offline-full Release APKs
+        working-directory: cyime-src
+        run: |
+          set -euo pipefail
+          echo "Using translate-library init script (upstream hash file untouched)"
+          ./gradlew assembleRelease \
+            -PbundleModels=true \
+            -PpythonExecutable=python3 \
+            -Pcyime.translateLibDir="$GITHUB_WORKSPACE/cyime-src/.codex-artifacts/offline-translate/libs" \
+            -PversionCode="${BUILD_DATE}" \
+            -PversionName="offline-${BUILD_DATE}-${SHORT_SHA}" \
+            --init-script "$RUNNER_TEMP/cyime-translate-init.gradle" \
+            --no-daemon
+
+      - name: Sign APKs (only when signing secrets are configured)
+        if: env.SIGNING_KEY != ''
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: cyime-src/app/build/outputs/apk/release
+          signingKeyBase64: ${{ env.SIGNING_KEY }}
+          alias: ${{ env.ALIAS }}
+          keyStorePassword: ${{ env.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ env.KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: "36.0.0"
+
+      - name: Prepare release assets and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DIR="cyime-src/app/build/outputs/apk/release"
+
+          mapfile -t ALL < <(find "$DIR" -maxdepth 1 -type f -name '*.apk' | sort)
+          # 只保留 arm64-v8a 产物（忽略可能残留的 universal / 其他架构 APK）
+          ARM64=()
+          for f in "${ALL[@]}"; do
+            case "$f" in *arm64-v8a*.apk) ARM64+=("$f");; esac
+          done
+          if ((${#ARM64[@]} > 0)); then
+            ALL=("${ARM64[@]}")
+          fi
+          SIGNED=()
+          for f in "${ALL[@]}"; do
+            case "$f" in *-signed.apk) SIGNED+=("$f");; esac
+          done
+          if ((${#SIGNED[@]} > 0)); then
+            APKS=("${SIGNED[@]}")
+            echo "Using signed APKs (${#APKS[@]})"
+          else
+            APKS=("${ALL[@]}")
+            echo "No signing secrets configured; publishing unsigned APKs (${#APKS[@]})"
+          fi
+          if ((${#APKS[@]} == 0)); then
+            echo "::error::No APK found in $DIR"
+            exit 1
+          fi
+
+          cp cyime-src/LICENSE ./LICENSE
+          cp cyime-src/app/src/main/assets/NOTICE.txt ./NOTICE.txt
+
+          TAG="cyime-offline-${BUILD_DATE}-${SHORT_SHA}"
+          # 源码 checkout 在 cyime-src 子目录，workspace 根目录不是 git 仓库，
+          # 必须显式指定 --repo，否则 gh 无法确定发布到哪个仓库。
+          REPO="${GITHUB_REPOSITORY}"
+          # 同一天同一提交重复手动触发时，先删旧 Release，保证幂等
+          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
+
+          cat > RELEASE_NOTES.md <<EOF
+          ## CyIME offline-full（自动构建）
+
+          - 基于上游 \`Cyletix/CyIME\` main 分支提交 \`${SHORT_SHA}\`
+          - 内置：离线语音、拍照识别（OCR）、离线翻译中译英 / 英译中
+          - 架构：仅 arm64-v8a（不产物其他架构 / universal 包）
+          - 已移除 Manifest 中的 INTERNET / ACCESS_WIFI_STATE / ACCESS_NETWORK_STATE / REQUEST_INSTALL_PACKAGES 声明
+          - 模型许可：Firefox Translations（MPL-2.0）、PP-OCRv5 / OpenCV（Apache-2.0）、SenseVoice（FunASR 许可）
+          - 项目许可：GPL-3.0；改造源码仓库需按 GPL-3.0 公开并保留上游版权声明
+          - 构建时间：${BUILD_DASH}
+          EOF
+
+          echo "- 离线翻译库：从 GitHub 最新 Release 的 arm64 full APK 提取（上游源码哈希未修改）" >> RELEASE_NOTES.md
+
+          if [[ -z "${SIGNING_KEY}" ]]; then
+            echo "NOTE: APKs are unsigned; sign locally before installing." >> RELEASE_NOTES.md
+          fi
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "CyIME offline-full ${BUILD_DASH} (${SHORT_SHA})" \
+            --notes-file RELEASE_NOTES.md \
+            --prerelease \
+            "${APKS[@]}" LICENSE NOTICE.txt
+
+          echo "Published release: $TAG"
