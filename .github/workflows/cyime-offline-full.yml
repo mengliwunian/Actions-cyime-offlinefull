@@ -445,6 +445,24 @@ jobs:
           patch('app/src/main/assets/NOTICE.txt', notice_bundled,
                 'NOTICE.txt: translation models marked bundled', allow_noop=True)
 
+          # 4b) 自编译包无法用作者私钥签名，关闭「非官方安装包」提示：
+          #     上游 check() 首行是 cached?.let { return it }；把缓存初值设为 SKIPPED，
+          #     第一次调用就直接返回 SKIPPED，两处提示（设置页弹框 + 输入法 Toast）都不触发。
+          #     只改一行，不动枚举和判断逻辑，保持与上游尽量同步。
+          def skip_install_integrity(text):
+              if 'offline-full patch: skip install integrity' in text:
+                  return text
+              old = 'private var cached: Result? = null'
+              new = ('private var cached: Result? = Result.SKIPPED  '
+                     '// offline-full patch: skip install integrity')
+              if old not in text:
+                  fail('cannot find InstallIntegrity.cached declaration; source changed upstream')
+              return text.replace(old, new, 1)
+
+          patch('app/src/main/java/com/kingzcheung/xime/security/InstallIntegrity.kt',
+                skip_install_integrity, 'skip unofficial-install warning for self-built APK',
+                allow_noop=True)
+
           # 5) tasks-offline-translate.gradle.kts 一个字节都不改：
           #    上游写死的 libcytranslate.so 哈希保持原样，便于与 main 同步；
           #    库本身由前面的「GitHub 最新 full APK 提取 + init script」准备。
@@ -491,12 +509,16 @@ jobs:
             exit 1
           fi
 
-      - name: Build offline-full Release APKs
+      # 必须用 assembleOffline，不能用 assembleRelease：
+      # 上游 app/src/offline/AndroidManifest.xml 用 tools:node="remove" 从合并后的 manifest
+      # 强制移除 INTERNET，能压掉依赖 AAR 注入的网络权限；该叠加层只在 offline 变体生效。
+      # offline = initWith(release)，保留 minify / 签名 / 版本号等 release 配置。
+      - name: Build offline-full APKs (offline variant, network stripped)
         working-directory: cyime-src
         run: |
           set -euo pipefail
           echo "Using translate-library init script (upstream hash file untouched)"
-          ./gradlew assembleRelease \
+          ./gradlew assembleOffline \
             -PbundleModels=true \
             -PpythonExecutable=python3 \
             -Pcyime.translateLibDir="$GITHUB_WORKSPACE/cyime-src/.codex-artifacts/offline-translate/libs" \
@@ -509,7 +531,7 @@ jobs:
         if: env.SIGNING_KEY != ''
         uses: r0adkll/sign-android-release@v1
         with:
-          releaseDirectory: cyime-src/app/build/outputs/apk/release
+          releaseDirectory: cyime-src/app/build/outputs/apk/offline
           signingKeyBase64: ${{ env.SIGNING_KEY }}
           alias: ${{ env.ALIAS }}
           keyStorePassword: ${{ env.KEY_STORE_PASSWORD }}
@@ -522,7 +544,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          DIR="cyime-src/app/build/outputs/apk/release"
+          DIR="cyime-src/app/build/outputs/apk/offline"
 
           mapfile -t ALL < <(find "$DIR" -maxdepth 1 -type f -name '*.apk' | sort)
           # 只保留 arm64-v8a 产物（忽略可能残留的 universal / 其他架构 APK）
